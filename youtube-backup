@@ -89,8 +89,12 @@ def creds():
     return c
 
 
-def page(c, path, params):
-    """Yield every item across all pages of a list endpoint."""
+def page(c, path, params, allow_missing_channel=False):
+    """Yield every item across all pages of a list endpoint.
+
+    allow_missing_channel: return None instead of dying when YouTube says the account has
+    no channel. That is the normal state for a HIDDEN channel - subscriptions stay
+    readable, but anything channel-scoped (playlists) resolves to nothing."""
     out, token = [], None
     while True:
         p = dict(params)
@@ -103,6 +107,13 @@ def page(c, path, params):
             soft_die(f"network unreachable during {path}: {type(e).__name__}")
         if r.status_code in (500, 503):
             soft_die(f"{path}: YouTube returned {r.status_code}, retrying later")
+        if r.status_code == 404 and allow_missing_channel:
+            try:
+                reason = r.json()["error"]["errors"][0].get("reason", "")
+            except Exception:
+                reason = ""
+            if reason == "channelNotFound":
+                return None
         if r.status_code != 200:
             die(f"{path} returned HTTP {r.status_code}: {r.text[:300]}")
         d = r.json()
@@ -134,10 +145,12 @@ def write_if_changed(name, header, rows):
     identical files a year; this way the dated files ARE the change history.
     """
     OUT.mkdir(parents=True, exist_ok=True)
-    buf = [",".join(header)]
     import io
     s = io.StringIO()
-    w = csv.writer(s)
+    # lineterminator="\n" is load-bearing, not cosmetic. csv.writer defaults to \r\n,
+    # but read_text() translates \r\n back to \n on the way in - so the hash of what we
+    # wrote never matched the hash of what we read, and every run looked "CHANGED".
+    w = csv.writer(s, lineterminator="\n")
     w.writerow(header)
     w.writerows(rows)
     body = s.getvalue()
@@ -169,11 +182,22 @@ def do_pull():
         rows.append([sn["resourceId"]["channelId"], sn["title"],
                      f"https://www.youtube.com/channel/{sn['resourceId']['channelId']}",
                      sn.get("publishedAt", "")])
+    # YouTube returns the same set in a DIFFERENT order between calls even with
+    # order=alphabetical (verified 2026-10-15: two runs a minute apart, identical when
+    # sorted, different hashes). Sort locally or change-detection is meaningless.
+    rows.sort(key=lambda r: (r[1].casefold(), r[0]))
     write_if_changed("subscriptions",
                      ["channel_id", "title", "url", "subscribed_at"], rows)
 
     pls = page(c, "playlists",
-               {"part": "snippet,contentDetails", "mine": "true", "maxResults": 50})
+               {"part": "snippet,contentDetails", "mine": "true", "maxResults": 50},
+               allow_missing_channel=True)
+    if pls is None:
+        log("playlists: SKIPPED - this account has no visible channel. The channel is "
+            "hidden, so playlists are invisible to the API. Subscriptions are unaffected. "
+            "To capture playlists: unhide the channel briefly, or use Google Takeout.")
+        log(f"OK  subscriptions={len(rows)} playlists=skipped(hidden channel)")
+        return
     prows, irows = [], []
     for pl in pls:
         sn, cd = pl["snippet"], pl.get("contentDetails", {})
@@ -188,6 +212,8 @@ def do_pull():
             irows.append([sn["title"], isn.get("position", ""), vid, isn.get("title", ""),
                           isn.get("videoOwnerChannelTitle", ""),
                           f"https://www.youtube.com/watch?v={vid}" if vid else ""])
+    prows.sort(key=lambda r: (str(r[1]).casefold(), r[0]))
+    irows.sort(key=lambda r: (str(r[0]).casefold(), int(r[1]) if str(r[1]).isdigit() else 0))
     write_if_changed("playlists",
                      ["playlist_id", "title", "item_count", "privacy", "url"], prows)
     write_if_changed("playlist-items",
