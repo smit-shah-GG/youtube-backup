@@ -1,0 +1,5 @@
+# Never commit credentials. These live in ~/.config/youtube-backup/ and have no
+# business in a public repo, but belt and braces.
+client_secret*.json
+token.json
+*.csv

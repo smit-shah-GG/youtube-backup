@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>youtube-backup</title>
+<style>
+  :root { --bg:#fbfbf9; --fg:#1b1b1a; --mut:#5c5c58; --line:#e2e2dd; --acc:#0b5cad; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#141414; --fg:#e8e8e4; --mut:#9a9a94; --line:#2b2b2b; --acc:#7cb3ea; }
+  }
+  * { box-sizing: border-box; }
+  body { background:var(--bg); color:var(--fg); margin:0;
+         font:16px/1.65 ui-serif, Georgia, "Times New Roman", serif;
+         padding:0 16px; }
+  main { max-width:40rem; margin:0 auto; padding:4rem 0 6rem; }
+  h1 { font-size:1.9rem; margin:0 0 .25rem; letter-spacing:-.01em; }
+  .sub { color:var(--mut); margin:0 0 2.5rem; font-style:italic; }
+  h2 { font-size:1.15rem; margin:2.5rem 0 .6rem; }
+  a { color:var(--acc); }
+  code { font:13.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+         background:color-mix(in srgb, var(--fg) 7%, transparent);
+         padding:.12em .4em; border-radius:3px; }
+  ul { padding-left:1.2rem; }
+  li { margin:.3rem 0; }
+  footer { margin-top:3.5rem; padding-top:1.2rem; border-top:1px solid var(--line);
+           color:var(--mut); font-size:.9rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>youtube-backup</h1>
+  <p class="sub">A single-user command-line tool that exports its owner's own YouTube
+  subscriptions and playlists to CSV files on their own computer.</p>
+
+  <h2>What it does</h2>
+  <p>It reads the signed-in account's subscription list and playlists through the
+  YouTube Data API v3 and writes them to CSV files on the local disk. It runs on a
+  weekly timer. A new dated file is written only when something has actually changed,
+  so the files double as a change history.</p>
+
+  <h2>Why it exists</h2>
+  <p>A YouTube account can be lost without warning, and deleting or losing a channel
+  takes its subscriptions, playlists and history with it irreversibly. These CSVs mean
+  that rebuilding starts from a list rather than from memory.</p>
+
+  <h2>What it does not do</h2>
+  <ul>
+    <li>It requests read-only access (<code>youtube.readonly</code>) and cannot change,
+        upload, delete or post anything.</li>
+    <li>It sends no data anywhere. Everything it writes stays on the machine it runs on.</li>
+    <li>It has no server, no analytics, no telemetry and no third-party services.</li>
+    <li>It is not a public service. It has exactly one user: its author.</li>
+  </ul>
+
+  <h2>Privacy</h2>
+  <p>See the <a href="privacy.html">privacy policy</a>.</p>
+
+  <footer>
+    Personal project. Source and issues on
+    <a href="https://github.com/smit-shah-GG/youtube-backup">GitHub</a>.
+  </footer>
+</main>
+</body>
+</html>

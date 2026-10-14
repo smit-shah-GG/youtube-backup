@@ -1,0 +1,223 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "google-auth==2.41.1",
+#   "google-auth-oauthlib==1.2.2",
+#   "requests==2.32.5",
+# ]
+# ///
+"""youtube-backup - export your own YouTube subscriptions and playlists to CSV.
+
+Why this exists: the YouTube channel is HIDDEN, not deleted, because deleting it would
+take subscriptions, playlists and watch history with it, irreversibly. These CSVs are the
+insurance policy - if the account is ever lost to a termination-by-association, the
+rebuild starts from a list instead of from memory.
+
+Usage:
+  youtube-backup --auth      one-time browser consent, writes the refresh token
+  youtube-backup             pull and write CSVs (what the timer runs)
+  youtube-backup --status    when it last succeeded, and what is on disk
+
+Read-only scope (youtube.readonly). It cannot change anything on the account.
+
+A backup that fails silently is worse than no backup, so any failure raises a critical
+desktop notification and exits non-zero. Check `--status` if you ever wonder.
+"""
+import argparse, csv, hashlib, json, os, subprocess, sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+import requests
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+
+SCOPES = ["https://www.googleapis.com/auth/youtube.readonly"]
+API = "https://www.googleapis.com/youtube/v3"
+
+CONF = Path.home() / ".config/youtube-backup"
+CLIENT_SECRET = CONF / "client_secret.json"
+TOKEN = CONF / "token.json"
+OUT = Path.home() / ".local/share/youtube-backup"
+STATE = Path.home() / ".local/state/youtube-backup.log"
+
+
+def log(msg):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    line = f"{datetime.now().strftime('%F %T')} {msg}"
+    with STATE.open("a") as f:
+        f.write(line + "\n")
+    print(line)
+
+
+def soft_die(msg):
+    """Transient failure (no network). Exit non-zero so systemd retries, but stay silent -
+    a backup tool that cries wolf about a closed laptop gets muted, and then the real
+    failure goes unseen too."""
+    log(f"transient: {msg}")
+    sys.exit(75)  # EX_TEMPFAIL
+
+
+def die(msg):
+    log(f"FAIL: {msg}")
+    try:
+        subprocess.run(["notify-send", "-u", "critical", "-a", "youtube-backup", "-t", "0",
+                        "YouTube backup failed", msg], timeout=10)
+    except Exception:
+        pass
+    sys.exit(1)
+
+
+def creds():
+    if not TOKEN.exists():
+        die("no token. Run: youtube-backup --auth")
+    c = Credentials.from_authorized_user_file(str(TOKEN), SCOPES)
+    if not c.valid:
+        if c.expired and c.refresh_token:
+            try:
+                c.refresh(Request())
+            except Exception as e:
+                if isinstance(e, (requests.ConnectionError, requests.Timeout)):
+                    soft_die("network unreachable during token refresh")
+                die(f"token refresh failed ({e}). If the Google Cloud project is still in "
+                    f"'Testing', refresh tokens expire after 7 days - publish it to "
+                    f"production, then re-run --auth.")
+            TOKEN.write_text(c.to_json())
+            TOKEN.chmod(0o600)
+        else:
+            die("token invalid and not refreshable. Re-run --auth.")
+    return c
+
+
+def page(c, path, params):
+    """Yield every item across all pages of a list endpoint."""
+    out, token = [], None
+    while True:
+        p = dict(params)
+        if token:
+            p["pageToken"] = token
+        try:
+            r = requests.get(f"{API}/{path}", params=p,
+                             headers={"Authorization": f"Bearer {c.token}"}, timeout=30)
+        except (requests.ConnectionError, requests.Timeout) as e:
+            soft_die(f"network unreachable during {path}: {type(e).__name__}")
+        if r.status_code in (500, 503):
+            soft_die(f"{path}: YouTube returned {r.status_code}, retrying later")
+        if r.status_code != 200:
+            die(f"{path} returned HTTP {r.status_code}: {r.text[:300]}")
+        d = r.json()
+        out.extend(d.get("items", []))
+        token = d.get("nextPageToken")
+        if not token:
+            return out
+
+
+def do_auth():
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    if not CLIENT_SECRET.exists():
+        die(f"missing {CLIENT_SECRET}. See the setup notes in this file's header comment.")
+    flow = InstalledAppFlow.from_client_secrets_file(str(CLIENT_SECRET), SCOPES)
+    c = flow.run_local_server(port=0, prompt="consent", access_type="offline")
+    CONF.mkdir(parents=True, exist_ok=True)
+    TOKEN.write_text(c.to_json())
+    TOKEN.chmod(0o600)
+    if not c.refresh_token:
+        die("authorised, but Google returned no refresh token - the timer would break in "
+            "an hour. Revoke this app at myaccount.google.com/permissions and re-run --auth.")
+    log(f"authorised, refresh token stored at {TOKEN}")
+
+
+def write_if_changed(name, header, rows):
+    """Dated file only when content actually changes; -latest.csv always current.
+
+    Subscriptions move slowly. Writing a fresh dated file every week would be 52 near
+    identical files a year; this way the dated files ARE the change history.
+    """
+    OUT.mkdir(parents=True, exist_ok=True)
+    buf = [",".join(header)]
+    import io
+    s = io.StringIO()
+    w = csv.writer(s)
+    w.writerow(header)
+    w.writerows(rows)
+    body = s.getvalue()
+
+    latest = OUT / f"{name}-latest.csv"
+    digest = hashlib.sha256(body.encode()).hexdigest()[:12]
+    prev = None
+    if latest.exists():
+        prev = hashlib.sha256(latest.read_text().encode()).hexdigest()[:12]
+
+    latest.write_text(body)
+    if prev == digest:
+        log(f"{name}: {len(rows)} rows, unchanged ({digest})")
+        return False
+    dated = OUT / f"{name}-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.csv"
+    dated.write_text(body)
+    log(f"{name}: {len(rows)} rows, CHANGED {prev or 'none'} -> {digest}, wrote {dated.name}")
+    return True
+
+
+def do_pull():
+    c = creds()
+
+    subs = page(c, "subscriptions",
+                {"part": "snippet", "mine": "true", "maxResults": 50, "order": "alphabetical"})
+    rows = []
+    for it in subs:
+        sn = it["snippet"]
+        rows.append([sn["resourceId"]["channelId"], sn["title"],
+                     f"https://www.youtube.com/channel/{sn['resourceId']['channelId']}",
+                     sn.get("publishedAt", "")])
+    write_if_changed("subscriptions",
+                     ["channel_id", "title", "url", "subscribed_at"], rows)
+
+    pls = page(c, "playlists",
+               {"part": "snippet,contentDetails", "mine": "true", "maxResults": 50})
+    prows, irows = [], []
+    for pl in pls:
+        sn, cd = pl["snippet"], pl.get("contentDetails", {})
+        prows.append([pl["id"], sn["title"], cd.get("itemCount", ""),
+                      sn.get("privacyStatus", pl.get("status", {}).get("privacyStatus", "")),
+                      f"https://www.youtube.com/playlist?list={pl['id']}"])
+        for it in page(c, "playlistItems",
+                       {"part": "snippet,contentDetails", "playlistId": pl["id"],
+                        "maxResults": 50}):
+            isn = it["snippet"]
+            vid = it.get("contentDetails", {}).get("videoId", "")
+            irows.append([sn["title"], isn.get("position", ""), vid, isn.get("title", ""),
+                          isn.get("videoOwnerChannelTitle", ""),
+                          f"https://www.youtube.com/watch?v={vid}" if vid else ""])
+    write_if_changed("playlists",
+                     ["playlist_id", "title", "item_count", "privacy", "url"], prows)
+    write_if_changed("playlist-items",
+                     ["playlist", "position", "video_id", "video_title", "channel", "url"], irows)
+
+    log(f"OK  subscriptions={len(rows)} playlists={len(prows)} playlist_items={len(irows)}")
+
+
+def do_status():
+    print(f"token:   {'present' if TOKEN.exists() else 'MISSING - run --auth'}")
+    print(f"output:  {OUT}")
+    if OUT.exists():
+        for f in sorted(OUT.iterdir()):
+            print(f"  {f.stat().st_size:>8}  {datetime.fromtimestamp(f.stat().st_mtime):%F %T}  {f.name}")
+    if STATE.exists():
+        print("\nlast 5 runs:")
+        for line in STATE.read_text().splitlines()[-5:]:
+            print(f"  {line}")
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--auth", action="store_true", help="one-time browser consent")
+    g.add_argument("--status", action="store_true", help="show state and files on disk")
+    a = ap.parse_args()
+    if a.auth:
+        do_auth()
+    elif a.status:
+        do_status()
+    else:
+        do_pull()
